@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bluefy offline spike</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        line-height: 1.45;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.5rem;
+      }
+      section {
+        margin: 0 0 24px;
+        padding: 16px;
+        border: 1px solid #9996;
+        border-radius: 12px;
+      }
+      h2 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+      }
+      button {
+        margin: 4px 8px 8px 0;
+        padding: 10px 14px;
+        border: 1px solid #888;
+        border-radius: 8px;
+        background: #8881;
+        font: inherit;
+      }
+      pre {
+        overflow-x: auto;
+        padding: 12px;
+        border-radius: 8px;
+        background: #8881;
+        white-space: pre-wrap;
+      }
+      .hint {
+        opacity: 0.75;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Bluefy offline spike</h1>
+      <p class="hint">
+        Phase 0 probe for offline Booth Mode. It touches no booth code. Open this page through the
+        HTTPS tunnel in Bluefy.
+      </p>
+
+      <section>
+        <h2>1. IndexedDB</h2>
+        <p id="idb">Checking...</p>
+        <p>Launch count: <strong id="launches">-</strong></p>
+        <p class="hint">Reload, close the tab, then kill Bluefy and reopen. The count must rise.</p>
+      </section>
+
+      <section>
+        <h2>2. Persistent storage</h2>
+        <button id="persist" type="button">Request persistent storage</button>
+        <pre id="storage">Not checked.</pre>
+      </section>
+
+      <section>
+        <h2>3. Service worker</h2>
+        <button id="register" type="button">Register service worker</button>
+        <p id="sw">Not registered.</p>
+        <button id="probe" type="button">Fetch probe.txt</button>
+        <pre id="probe-result">Not checked.</pre>
+        <p class="hint">
+          Register, reload once, then turn on airplane mode and reload again. If the page and probe
+          still load, the worker works.
+        </p>
+      </section>
+
+      <section>
+        <h2>Report</h2>
+        <button id="copy" type="button">Copy report</button>
+        <button id="clear" type="button">Clear spike data</button>
+        <pre id="report">{}</pre>
+      </section>
+    </main>
+
+    <script>
+      const report = { startedAt: new Date().toISOString() };
+      const byId = (id) => document.getElementById(id);
+
+      function render() {
+        byId('report').textContent = JSON.stringify(report, null, 2);
+      }
+
+      function openDb() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open('offline-spike', 1);
+          request.onupgradeneeded = () => request.result.createObjectStore('kv');
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => resolve(request.result);
+        });
+      }
+
+      function readKey(db, key) {
+        return new Promise((resolve, reject) => {
+          const request = db.transaction('kv', 'readonly').objectStore('kv').get(key);
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => resolve(request.result);
+        });
+      }
+
+      function writeKey(db, key, value) {
+        return new Promise((resolve, reject) => {
+          const request = db.transaction('kv', 'readwrite').objectStore('kv').put(value, key);
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => resolve();
+        });
+      }
+
+      async function checkIndexedDb() {
+        report.secureContext = window.isSecureContext;
+        report.standalone = window.navigator.standalone ?? null;
+        report.userAgent = navigator.userAgent;
+        try {
+          const db = await openDb();
+          const previous = (await readKey(db, 'launches')) ?? 0;
+          await writeKey(db, 'launches', previous + 1);
+          const readBack = await readKey(db, 'launches');
+          report.indexedDb = {
+            previous,
+            readBack,
+            previousLaunchFound: previous > 0,
+          };
+          byId('launches').textContent = String(readBack);
+          byId('idb').textContent =
+            previous > 0
+              ? 'Read back data from an earlier launch.'
+              : 'First launch in this browser profile.';
+        } catch (error) {
+          report.indexedDbError = String(error);
+          byId('idb').textContent = String(error);
+        }
+        render();
+      }
+
+      async function checkStorage() {
+        const storage = navigator.storage;
+        if (!storage) {
+          report.storage = 'unsupported';
+          byId('storage').textContent = 'navigator.storage is unavailable.';
+          return;
+        }
+        try {
+          report.storage = {
+            persistedBefore: storage.persisted ? await storage.persisted() : 'unsupported',
+            persistGranted: storage.persist ? await storage.persist() : 'unsupported',
+            estimate: storage.estimate ? await storage.estimate() : 'unsupported',
+          };
+          byId('storage').textContent = JSON.stringify(report.storage, null, 2);
+        } catch (error) {
+          report.storage = String(error);
+          byId('storage').textContent = String(error);
+        }
+        render();
+      }
+
+      async function registerWorker() {
+        if (!('serviceWorker' in navigator)) {
+          report.serviceWorker = 'unsupported';
+          byId('sw').textContent = 'Service workers are unavailable.';
+          render();
+          return;
+        }
+        try {
+          const registration = await navigator.serviceWorker.register('/offline-spike/sw.js', {
+            scope: '/offline-spike/',
+          });
+          await navigator.serviceWorker.ready;
+          report.serviceWorker = {
+            scope: registration.scope,
+            active: Boolean(registration.active),
+            controller: Boolean(navigator.serviceWorker.controller),
+          };
+          byId('sw').textContent = navigator.serviceWorker.controller
+            ? 'Worker active and controlling this page.'
+            : 'Worker active. Reload once so it controls this page.';
+        } catch (error) {
+          report.serviceWorker = String(error);
+          byId('sw').textContent = String(error);
+        }
+        render();
+      }
+
+      async function fetchProbe() {
+        try {
+          const response = await fetch('/offline-spike/probe.txt', { cache: 'no-store' });
+          report.probe = {
+            ok: response.ok,
+            status: response.status,
+            controlled: Boolean(navigator.serviceWorker.controller),
+            body: (await response.text()).trim(),
+          };
+        } catch (error) {
+          report.probe = String(error);
+        }
+        byId('probe-result').textContent = JSON.stringify(report.probe, null, 2);
+        render();
+      }
+
+      byId('persist').addEventListener('click', () => void checkStorage());
+      byId('register').addEventListener('click', () => void registerWorker());
+      byId('probe').addEventListener('click', () => void fetchProbe());
+      byId('copy').addEventListener('click', async () => {
+        const text = JSON.stringify(report, null, 2);
+        try {
+          await navigator.clipboard.writeText(text);
+          byId('copy').textContent = 'Copied';
+        } catch {
+          byId('report').textContent = text;
+        }
+      });
+      byId('clear').addEventListener('click', async () => {
+        indexedDB.deleteDatabase('offline-spike');
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(registrations.map((registration) => registration.unregister()));
+        location.reload();
+      });
+
+      void checkIndexedDb();
+      void checkStorage();
+      void registerWorker();
+      render();
+    </script>
+  </body>
+</html>
